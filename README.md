@@ -1,0 +1,2 @@
+# flutter_ipvideoplayer
+该项目为安卓前端项目，使用flutter构造，引用media_kit模块做为播放器，目前只支持配套的后端golang进行适配播放。播放器只具备正常播放快进等基础播放，
