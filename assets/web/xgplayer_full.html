@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>XGPlayer</title>
+
+  <!-- 最新 xgplayer 核心库 -->
+  <link rel="stylesheet" href="index.min.css">
+  <script src="index.js"></script>
+
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: black;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+    }
+    #xgplayer {
+      width: 100%;
+      height: 100%;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="xgplayer"></div>
+
+  <script>
+    console.log("xgplayer-debug: 页面加载完成");
+
+    // Flutter 注入播放器配置的方法
+    function initPlayer(config) {
+      try {
+        console.log("xgplayer-debug: initPlayer config:", config);
+
+        if (!config || !config.url) {
+          console.warn("xgplayer-debug: 未提供视频地址");
+          return;
+        }
+
+        window.player = new Player({
+          id: 'xgplayer',
+          url: config.url,
+          poster: config.poster || '',
+          autoplay: false,
+          playsinline: true,
+          preload: 'auto',
+          lang: 'zh-cn',
+          fluid: true,
+          controls: true,
+          cssFullscreen: true,
+          screenShot: true,
+          controlPlugins: [
+            'play',
+            'progress',
+            'time',
+            'volume',
+            'fullscreen',
+            'cssfullscreen',
+            'screenshot',
+            'pip',
+            'setting'
+          ],
+          // 错误提示配置（可选）
+          errorTips: {
+            errorText: '播放失败，请稍后重试'
+          }
+        });
+
+        window.player.on('error', function (e) {
+          console.error("xgplayer-debug: 播放器 error 事件:", e);
+        });
+
+      } catch (e) {
+        console.error("xgplayer-debug: 初始化播放器失败", e);
+      }
+    }
+
+    // 如果你希望测试页面可自动初始化测试视频，可取消以下注释：
+    /*
+    initPlayer({
+      url: 'https://www.w3schools.com/html/mov_bbb.mp4',
+      poster: 'https://via.placeholder.com/800x450.png?text=Poster'
+    });
+    */
+  </script>
+</body>
+</html>

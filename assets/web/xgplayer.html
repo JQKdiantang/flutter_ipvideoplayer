@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+    <title>视频播放器</title>
+    <style>
+        html, body {
+          margin: 0;
+          padding: 0;
+          background-color: #000;
+          height: 100%;
+          overflow: hidden;
+        }
+        #player-container {
+          width: 100%;
+          height: 100%;
+        }
+    </style>
+    <!-- 添加 xgplayer 样式 -->
+    <link rel="stylesheet" href="index.min.css" />
+</head>
+<body>
+<div id="player-container"></div>
+
+<!-- 添加 xgplayer 主库 -->
+<script src="index.js"></script>
+<!-- 可选: 支持 HLS 播放 -->
+<script src="hlsindex.js"></script>
+<!-- 可选: 支持 H265 解码（xgplayer 不原生支持 H265软解，仅浏览器支持才可） -->
+<!-- 若需支持扩展格式（如 flv），可加载相应插件 -->
+
+<script>
+    const container = document.getElementById('player-container');
+
+    // 检查 Flutter 注入配置
+    function initPlayer(config) {
+      console.log("xgplayer-debug: initPlayer config:", config);
+      if (window.player && typeof window.player.destroy === 'function') {
+        try {
+          window.player.destroy();
+        } catch (e) {
+          console.warn("xgplayer-debug: 销毁旧播放器出错:", e);
+        }
+      }
+
+      // 创建新播放器
+      const isHls = config.url.endsWith(".m3u8");
+      const PlayerConstructor = isHls ? HlsPlayer : window.Player;
+
+      window.player = new PlayerConstructor({
+        id: 'player-container',
+        url: config.url,
+        poster: config.poster || '',
+        playsinline: true,
+        autoplay: false,
+        volume: 0.8,
+        fluid: true,
+        startTime: config.startTime || 0,
+        lang: 'zh-cn',
+        whitelist: ['*'], // 允许全部平台尝试播放
+        enableContextmenu: false,
+        screenShot: true,
+        pip: true,
+        playbackRate: [0.5, 1.0, 1.25, 1.5, 2.0],
+        controls: true,
+        plugins: []
+      });
+
+      window.player.on('error', (e) => {
+        console.error("xgplayer-debug: 播放器 error 事件:", e);
+      });
+
+      window.player.on('complete', () => {
+        console.log("xgplayer-debug: 视频播放完成");
+      });
+    }
+
+    // Flutter 调用 initPlayer({url, poster, startTime})
+    window.initPlayer = initPlayer;
+
+    // 页面直接加载时输出提示（用于测试）
+    console.log("xgplayer-debug: 页面加载完成");
+</script>
+</body>
+</html>
