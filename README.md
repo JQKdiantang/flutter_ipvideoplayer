@@ -1,2 +1,16 @@
-# flutter_ipvideoplayer
-该项目为安卓前端项目，使用flutter构造，引用media_kit模块做为播放器，目前只支持配套的后端golang进行适配播放。播放器只具备正常播放快进等基础播放，
+# deomotwo_video
+
+two
+
+## Getting Started
+
+This project is a starting point for a Flutter application.
+
+A few resources to get you started if this is your first Flutter project:
+
+- [Lab: Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
+- [Cookbook: Useful Flutter samples](https://docs.flutter.dev/cookbook)
+
+For help getting started with Flutter development, view the
+[online documentation](https://docs.flutter.dev/), which offers tutorials,
+samples, guidance on mobile development, and a full API reference.
