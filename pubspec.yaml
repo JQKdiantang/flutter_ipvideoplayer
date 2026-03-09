@@ -38,22 +38,21 @@ dependencies:
   http:
   #webview_flutter: ^4.2.2
   volume_controller: ^3.4.0
-  flutter_vlc_player: ^7.4.3
+
   cached_network_image: ^3.0.0
   screen_brightness: ^2.1.5
-  video_player:
+
   file_picker:
   flutter_slidable:
-  permission_handler: ^12.0.1
+  permission_handler:
   shared_preferences:  # 用于保存设置
-  path_provider: ^2.0.11
-  connectivity_plus:         # 网络监听与检测。:contentReference[oaicite:3]{index=3}
-# Android PiP 支持。:contentReference[oaicite:4]{index=4}
+  path_provider:
+  connectivity_plus:
+
   media_cast_dlna:
   media_kit:
   media_kit_video:
-  media_kit_libs_video:  # 这是Windows/Linux等桌面端需要的原生库
-
+  media_kit_libs_video:
   logger:
 dev_dependencies:
   flutter_launcher_icons:
