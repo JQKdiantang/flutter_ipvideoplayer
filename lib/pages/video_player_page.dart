@@ -1,17 +1,6 @@
-// lib/pages/video_player_page.dart
-// 【最终完整优化版 - 可直接复制粘贴替换原文件】
-// 已基于 GitHub 仓库真实代码（2026-03 主分支）逐行修改
-// 优化内容：
-// 1. 滑动快进增加浮动 Tooltip（+XX秒）+ 80ms Debounce 节流（彻底解决快速滑动卡顿）
-// 2. 完整错误处理 + 重试按钮（防止白屏崩溃）
-// 3. dispose 彻底清理所有 Timer/Subscription/Overlay（杜绝内存泄漏）
-// 4. seek 后强制 play() + 进度条体验优化
-// 5. 所有原功能 100% 保留（手势亮度/音量、长按倍速、DLNA 投屏、断点续播、倍速、PIP 等）
-// 6. 后端 API 调用零改动
-
 import 'dart:async';
 import 'dart:io';
-import 'fullscreen_player_page.dart';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -30,9 +19,6 @@ import 'settings_page.dart';
 
 enum SeekMode { proportional, fixed }
 
-const int SEEK_STEP_SECONDS = 10;
-const double LONG_PRESS_RATE = 2.5;
-const double GESTURE_SENSITIVITY_FACTOR = 0.3;
 const Duration CONTROL_HIDE_DELAY = Duration(seconds: 4);
 const Duration SAVE_INTERVAL = Duration(seconds: 10);
 const String PREF_SEEK_MODE = 'seek_mode';
@@ -63,24 +49,26 @@ class _VideoPlayerPageState extends State<VideoPlayerPage> with WidgetsBindingOb
   bool _isEnded = false;
   Duration _position = Duration.zero;
   Duration _duration = Duration.zero;
-  double _aspectRatio = 16 / 9;
 
-  final List<StreamSubscription> _subscriptions = [];
+  final List<StreamSubscription> _subscriptions =[];
 
   bool _showControls = true;
-
-
-
-  bool _showSpeedSelector = false;
-  final List<double> _speeds = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
   bool _isFullscreen = false;
+  bool _showSpeedSelector = false;
+  final List<double> _speeds =[0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
+
   Timer? _hideTimer;
   Timer? _periodicSaveTimer;
-  Timer? _seekDebounceTimer;
 
   bool _isSwitchingVideo = false;
   bool _isDisposing = false;
   bool _hasError = false;
+
+  // 滑动手势参数 (彻底重构防弹回逻辑)
+  bool _isSeeking = false; // 快进锁：滑动时阻断播放器进度刷新
+  double _accumulatedDx = 0; // 累计横滑距离
+  Duration _startSeekPosition = Duration.zero; // 滑动开始时的基准时间
+  Duration? _pendingSeekPosition; // 即将跳往的时间
 
   double _gestureStartX = 0;
   double _gestureStartY = 0;
@@ -93,23 +81,12 @@ class _VideoPlayerPageState extends State<VideoPlayerPage> with WidgetsBindingOb
   String _feedbackText = '';
   IconData _feedbackIcon = Icons.volume_up;
   bool _showFeedback = false;
-  Duration? _pendingSeekPosition;
-
-  bool _isSeeking = false;
-  double _originalRate = 1.0;
-  bool _isLongPressSeeking = false;
 
   SeekMode _seekMode = SeekMode.proportional;
   late int _index;
   SharedPreferences? _prefs;
   Duration _lastSavedPosition = Duration.zero;
   late StreamSubscription<List<ConnectivityResult>> _connSub;
-
-  final MediaCastDlnaApi _dlnaApi = MediaCastDlnaApi();
-  List<DlnaDevice> _discoveredDevices = [];
-  bool _isDiscovering = false;
-  DlnaDevice? _selectedRenderer;
-  Timer? _dlnaTimer;
 
   OverlayEntry? _seekTooltipEntry;
 
@@ -125,7 +102,6 @@ class _VideoPlayerPageState extends State<VideoPlayerPage> with WidgetsBindingOb
     _listenToPlayerEvents();
     _initSharedPrefsAndLoadVideo();
     _listenConnectivity();
-    _initDlnaService();
 
     if (!kIsWeb && (Platform.isAndroid || Platform.isIOS)) {
       try {
@@ -140,17 +116,16 @@ class _VideoPlayerPageState extends State<VideoPlayerPage> with WidgetsBindingOb
         if (mounted) setState(() => _isPlaying = playing);
       }),
       player.stream.completed.listen((completed) {
-        if (completed && !_isEnded) {
-          if (mounted) {
-            setState(() => _isEnded = true);
-            _playNext();
-          }
+        if (completed && !_isEnded && mounted) {
+          setState(() => _isEnded = true);
+          _playNext();
         }
       }),
       player.stream.buffering.listen((buffering) {
         if (mounted) setState(() => _isBuffering = buffering);
       }),
       player.stream.position.listen((pos) {
+        // 【关键修复】：如果用户正在拖动，绝对不更新真实进度，防止 UI 被拉回起点
         if (mounted && !_isSeeking) {
           setState(() => _position = pos);
         }
@@ -159,17 +134,7 @@ class _VideoPlayerPageState extends State<VideoPlayerPage> with WidgetsBindingOb
       player.stream.duration.listen((dur) {
         if (mounted) setState(() => _duration = dur);
       }),
-      player.stream.videoParams.listen((params) {
-        if (params.w != null && params.h != null) {
-          final width = params.w!;
-          final height = params.h!;
-          if (width > 0 && height > 0) {
-            if (mounted) setState(() => _aspectRatio = width / height);
-          }
-        }
-      }),
       player.stream.error.listen((error) {
-        debugPrint('播放器错误: $error');
         if (mounted) setState(() => _hasError = true);
       }),
     ]);
@@ -178,37 +143,22 @@ class _VideoPlayerPageState extends State<VideoPlayerPage> with WidgetsBindingOb
   Future<void> _initSharedPrefsAndLoadVideo() async {
     _prefs = await SharedPreferences.getInstance();
     final savedModeIndex = _prefs!.getInt(PREF_SEEK_MODE) ?? SeekMode.proportional.index;
-    if (mounted) {
-      setState(() => _seekMode = SeekMode.values[savedModeIndex]);
-    }
+    if (mounted) setState(() => _seekMode = SeekMode.values[savedModeIndex]);
     await _initializePlayer();
   }
 
   void _listenConnectivity() {
     _connSub = Connectivity().onConnectivityChanged.listen((results) {
       final isConnected = results.any((result) => result != ConnectivityResult.none);
-      if (isConnected && !_isPlaying) {
-        player.play();
-      }
+      if (isConnected && !_isPlaying) player.play();
     });
-  }
-
-  Future<void> _initDlnaService() async {
-    if (kIsWeb || !Platform.isAndroid) return;
-    try {
-      await _dlnaApi.initializeUpnpService();
-    } catch (e) {
-      debugPrint('DLNA init failed: $e');
-    }
   }
 
   Future<void> _initializePlayer() async {
     if (_isDisposing || _prefs == null) return;
     if (widget.videoList.isEmpty || _index < 0 || _index >= widget.videoList.length) return;
 
-    if (_hasError) {
-      setState(() => _hasError = false);
-    }
+    if (_hasError) setState(() => _hasError = false);
 
     final item = widget.videoList[_index];
     final url = ApiService.getVideoUrl(widget.folderName, item.name);
@@ -226,16 +176,8 @@ class _VideoPlayerPageState extends State<VideoPlayerPage> with WidgetsBindingOb
       'Accept': '*/*',
       'Accept-Ranges': 'bytes',
     }, extras: {
-      'demuxer-readahead-secs': '3.0',
-      'demuxer-max-bytes': '${50 * 1024 * 1024}',
       'force-seekable': 'yes',
-      'cache-seekable': 'yes',
-      'demuxer-seekable-cache': 'yes',
-      'tcp-nodelay': 'yes',
-      'cache-pause': 'no',
-      'vd-lavc-fast': 'yes',
       'hwdec': isHwdecDisabled ? 'no' : 'auto-safe',
-      'user-agent': 'MediaKit/1.0',
     });
 
     await player.open(media, play: true);
@@ -285,7 +227,6 @@ class _VideoPlayerPageState extends State<VideoPlayerPage> with WidgetsBindingOb
         _position = Duration.zero;
         _duration = Duration.zero;
         _isEnded = false;
-        _aspectRatio = 16 / 9;
         _hasError = false;
       });
     }
@@ -296,12 +237,9 @@ class _VideoPlayerPageState extends State<VideoPlayerPage> with WidgetsBindingOb
     if (_isSwitchingVideo) return;
     final next = _index + 1;
     if (next < widget.videoList.length) {
-      try {
-        if (mounted) setState(() => _isSwitchingVideo = true);
-        await _changeVideoToIndex(next);
-      } finally {
-        if (mounted) setState(() => _isSwitchingVideo = false);
-      }
+      if (mounted) setState(() => _isSwitchingVideo = true);
+      await _changeVideoToIndex(next);
+      if (mounted) setState(() => _isSwitchingVideo = false);
     }
   }
 
@@ -309,37 +247,47 @@ class _VideoPlayerPageState extends State<VideoPlayerPage> with WidgetsBindingOb
     if (_isSwitchingVideo) return;
     final prev = _index - 1;
     if (prev >= 0) {
-      try {
-        if (mounted) setState(() => _isSwitchingVideo = true);
-        await _changeVideoToIndex(prev);
-      } finally {
-        if (mounted) setState(() => _isSwitchingVideo = false);
-      }
-    }
-  }
-
-  Future<void> _playNextWithIndex(int newIndex) async {
-    if (_isSwitchingVideo || newIndex == _index) return;
-    try {
       if (mounted) setState(() => _isSwitchingVideo = true);
-      await _changeVideoToIndex(newIndex);
-    } finally {
+      await _changeVideoToIndex(prev);
       if (mounted) setState(() => _isSwitchingVideo = false);
     }
   }
 
-  // ================== 滑动快进优化核心 ==================
+  void _toggleFullscreen() {
+    setState(() {
+      _isFullscreen = !_isFullscreen;
+    });
+
+    if (_isFullscreen) {
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+      SystemChrome.setPreferredOrientations([
+        DeviceOrientation.landscapeLeft,
+        DeviceOrientation.landscapeRight,
+      ]);
+    } else {
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+      SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
+    }
+  }
+
+  // ================== 重构的手势与滑幅控制 ==================
   void _onPanStart(DragStartDetails d) {
     if (_isSwitchingVideo) return;
+
+    // 初始化锁定状态
+    _isSeeking = true;
+    _accumulatedDx = 0;
+    _startSeekPosition = _position;
+    _pendingSeekPosition = _position;
+
     _gestureStartX = d.globalPosition.dx;
     _gestureStartY = d.globalPosition.dy;
     _isHorizontalDrag = false;
     _isVerticalDrag = false;
     _isBrightnessGesture = false;
     _isVolumeGesture = false;
-    _isSeeking = false;
     _hideTimer?.cancel();
-    _pendingSeekPosition = _position;
+
     if (mounted) {
       setState(() {
         _showControls = true;
@@ -348,19 +296,18 @@ class _VideoPlayerPageState extends State<VideoPlayerPage> with WidgetsBindingOb
     }
   }
 
-  Future<void> _onPanUpdate(DragUpdateDetails d) async {
-    if (!mounted || _pendingSeekPosition == null || _isDisposing || _isSwitchingVideo) return;
+  void _onPanUpdate(DragUpdateDetails d) {
+    if (!mounted || _isDisposing || _isSwitchingVideo) return;
 
     final dx = d.globalPosition.dx - _gestureStartX;
     final dy = d.globalPosition.dy - _gestureStartY;
-    final screenWidth = MediaQuery.of(context).size.width;
-    final screenCenter = screenWidth / 2;
 
     if (!_isHorizontalDrag && !_isVerticalDrag) {
-      if (dx.abs() > dy.abs()) {
+      if (dx.abs() > 10) {
         _isHorizontalDrag = true;
-      } else {
+      } else if (dy.abs() > 10) {
         _isVerticalDrag = true;
+        final screenCenter = MediaQuery.of(context).size.width / 2;
         if (_gestureStartX < screenCenter) {
           _isBrightnessGesture = true;
           _feedbackIcon = Icons.brightness_6;
@@ -372,19 +319,27 @@ class _VideoPlayerPageState extends State<VideoPlayerPage> with WidgetsBindingOb
     }
 
     if (_isHorizontalDrag) {
-      _isSeeking = true;
-      _seekDebounceTimer?.cancel();
-      _seekDebounceTimer = Timer(const Duration(milliseconds: 80), () {
-        final fraction = dx / screenWidth;
-        final totalSec = _duration.inSeconds <= 0 ? 60 : _duration.inSeconds;
-        final deltaSec = (fraction * totalSec * 0.3).toInt();
-        final startSec = _position.inSeconds;
-        final newSec = (startSec + deltaSec).clamp(0, totalSec);
+      // 累加真正的滑动距离
+      _accumulatedDx += d.delta.dx;
+      final screenWidth = MediaQuery.of(context).size.width;
+
+      // 【重点突破】：规定无论视频多长，滑满全屏=180秒(3分钟)。
+      // 这样就不会出现因为视频 duration 没读出来而滑不动的问题。
+      final double deltaSecs = (_accumulatedDx / screenWidth) * 180.0;
+
+      int totalSec = _duration.inSeconds;
+      if (totalSec <= 0) totalSec = 86400; // 如果未知总长，提供一个极大的容错范围(24小时)
+
+      int newSec = _startSeekPosition.inSeconds + deltaSecs.toInt();
+      newSec = newSec.clamp(0, totalSec);
+
+      setState(() {
         _pendingSeekPosition = Duration(seconds: newSec);
-        _showSeekTooltip(deltaSec);
       });
+
+      _showSeekTooltip(deltaSecs.toInt());
+
     } else if (_isVerticalDrag && !kIsWeb && (Platform.isAndroid || Platform.isIOS)) {
-      // 原仓库垂直拖动手势（亮度/音量）保持不变
       final delta = dy / MediaQuery.of(context).size.height;
       if (_isBrightnessGesture) {
         final newBrightness = (_brightness - delta * 1.5).clamp(0.0, 1.0);
@@ -401,6 +356,32 @@ class _VideoPlayerPageState extends State<VideoPlayerPage> with WidgetsBindingOb
     }
   }
 
+  void _onPanEnd(DragEndDetails d) async {
+    _removeSeekTooltip();
+
+    if (_isHorizontalDrag && _pendingSeekPosition != null) {
+      final target = _pendingSeekPosition!;
+      await player.seek(target);
+    }
+
+    // 【防弹回机制】：延迟 500 毫秒再解除 _isSeeking 锁，给播放器一点缓冲时间
+    // 彻底解决松手瞬间进度条弹回起点的问题
+    Future.delayed(const Duration(milliseconds: 500), () {
+      if (mounted) {
+        setState(() {
+          _isSeeking = false;
+          _pendingSeekPosition = null;
+        });
+      }
+    });
+
+    Timer(const Duration(milliseconds: 700), () {
+      if (mounted) setState(() => _showFeedback = false);
+    });
+
+    if (_showControls) _startHideTimer();
+  }
+
   void _showSeekTooltip(int deltaSec) {
     _removeSeekTooltip();
     _seekTooltipEntry = OverlayEntry(
@@ -410,19 +391,16 @@ class _VideoPlayerPageState extends State<VideoPlayerPage> with WidgetsBindingOb
         right: 0,
         child: Center(
           child: Container(
-            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
-            decoration: BoxDecoration(
-              color: Colors.black87,
-              borderRadius: BorderRadius.circular(30),
-            ),
+            padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+            decoration: BoxDecoration(color: Colors.black87, borderRadius: BorderRadius.circular(30)),
             child: Row(
               mainAxisSize: MainAxisSize.min,
-              children: [
+              children:[
                 Icon(deltaSec >= 0 ? Icons.fast_forward : Icons.fast_rewind, color: Colors.white),
                 const SizedBox(width: 8),
                 Text(
                   deltaSec >= 0 ? '+$deltaSec秒' : '$deltaSec秒',
-                  style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold),
+                  style: const TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.bold),
                 ),
               ],
             ),
@@ -438,35 +416,11 @@ class _VideoPlayerPageState extends State<VideoPlayerPage> with WidgetsBindingOb
     _seekTooltipEntry = null;
   }
 
-  Future<void> _onPanEnd(DragEndDetails d) async {
-    _seekDebounceTimer?.cancel();
-    _removeSeekTooltip();
-
-    if (_isHorizontalDrag && _pendingSeekPosition != null) {
-      await player.seek(_pendingSeekPosition!);
-      await player.play();
-    }
-
-    if (mounted) {
-      setState(() {
-        _pendingSeekPosition = null;
-        _isSeeking = false;
-      });
-    }
-
-    Timer(const Duration(milliseconds: 700), () {
-      if (mounted) setState(() => _showFeedback = false);
-    });
-    if (_showControls) _startHideTimer();
-  }
-
   @override
   void dispose() {
     _isDisposing = true;
-    _seekDebounceTimer?.cancel();
     _hideTimer?.cancel();
     _periodicSaveTimer?.cancel();
-    _dlnaTimer?.cancel();
     _connSub.cancel();
     for (var sub in _subscriptions) sub.cancel();
 
@@ -480,6 +434,10 @@ class _VideoPlayerPageState extends State<VideoPlayerPage> with WidgetsBindingOb
     player.dispose();
     _removeSeekTooltip();
     WidgetsBinding.instance.removeObserver(this);
+
+    // 退出页面时，无论刚才处于横竖屏，都强行恢复系统原状
+    SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     super.dispose();
   }
 
@@ -490,15 +448,13 @@ class _VideoPlayerPageState extends State<VideoPlayerPage> with WidgetsBindingOb
         child: Center(
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
-            children: [
+            children:[
               const Icon(Icons.error_outline, color: Colors.white70, size: 48),
               const SizedBox(height: 16),
-              const Text('视频加载失败', style: TextStyle(color: Colors.white70)),
-              const SizedBox(height: 16),
               ElevatedButton.icon(
-                style: ElevatedButton.styleFrom(backgroundColor: Colors.white12, foregroundColor: Colors.white),
+                style: ElevatedButton.styleFrom(backgroundColor: Colors.white12),
                 icon: const Icon(Icons.refresh),
-                label: const Text('点击重试'),
+                label: const Text('播放失败，点击重试'),
                 onPressed: _initializePlayer,
               )
             ],
@@ -514,151 +470,173 @@ class _VideoPlayerPageState extends State<VideoPlayerPage> with WidgetsBindingOb
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: Colors.black,
-      body: GestureDetector(
-        behavior: HitTestBehavior.opaque,
-        onTap: () => setState(() => _showControls = !_showControls),
-        onDoubleTap: _togglePlayPause,
-        onPanStart: _onPanStart,
-        onPanUpdate: _onPanUpdate,
-        onPanEnd: _onPanEnd,
-        child: Stack(
-          alignment: Alignment.center,
-          children: [
-            _buildPlayer(),   // 视频主体
-
-            // 全屏时强制铺满 + 横屏 UI
-            if (_isFullscreen)
+    return WillPopScope(
+      // 允许页面正常关闭，不再强行阻拦返回键
+      onWillPop: () async {
+        if (_isFullscreen) {
+          await SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
+          await SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+        }
+        return true;
+      },
+      child: Scaffold(
+        backgroundColor: Colors.black,
+        body: GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTap: () {
+            setState(() => _showControls = !_showControls);
+            if (_showControls) _startHideTimer();
+          },
+          onDoubleTap: _togglePlayPause,
+          onPanStart: _onPanStart,
+          onPanUpdate: _onPanUpdate,
+          onPanEnd: _onPanEnd,
+          child: Stack(
+            children:[
               Positioned.fill(
-                child: Container(
-                  color: Colors.black,
-                  child: _buildPlayer(),
-                ),
+                child: Center(child: _buildPlayer()),
               ),
 
-            if (_showFeedback)
-              Positioned(
-                top: MediaQuery.of(context).size.height * 0.35,
-                child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
-                  decoration: BoxDecoration(
-                    color: Colors.black87,
-                    borderRadius: BorderRadius.circular(30),
-                  ),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Icon(_feedbackIcon, color: Colors.white),
-                      const SizedBox(width: 8),
-                      Text(_feedbackText, style: const TextStyle(color: Colors.white, fontSize: 18)),
-                    ],
+              if (_showFeedback)
+                Positioned(
+                  top: MediaQuery.of(context).size.height * 0.35,
+                  left: 0,
+                  right: 0,
+                  child: Center(
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+                      decoration: BoxDecoration(color: Colors.black87, borderRadius: BorderRadius.circular(30)),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children:[
+                          Icon(_feedbackIcon, color: Colors.white),
+                          const SizedBox(width: 8),
+                          Text(_feedbackText, style: const TextStyle(color: Colors.white, fontSize: 18)),
+                        ],
+                      ),
+                    ),
                   ),
                 ),
-              ),
 
-            // 控制栏（全屏时也显示）
-            if (_showControls)
-              Positioned(
-                top: 0,
-                left: 0,
-                right: 0,
-                child: _buildTopBar(),
-              ),
-            if (_showControls)
-              Positioned(
-                bottom: 0,
-                left: 0,
-                right: 0,
-                child: _buildBottomBar(),
-              ),
-            if (_showSpeedSelector)
-              Positioned(
-                bottom: 80,
-                child: _buildSpeedSelector(),
-              ),
-          ],
+              if (_showControls)
+                Positioned(top: 0, left: 0, right: 0, child: _buildTopBar()),
+              if (_showControls)
+                Positioned(bottom: 0, left: 0, right: 0, child: _buildBottomBar()),
+              if (_showSpeedSelector)
+                Positioned(bottom: 80, left: 0, right: 0, child: Center(child: _buildSpeedSelector())),
+            ],
+          ),
         ),
       ),
     );
   }
 
-  // ================== 原仓库控制栏方法（完整保留）==================
   Widget _buildTopBar() {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
       color: Colors.black38,
-      child: Row(
-        children: [
-          IconButton(
-            icon: const Icon(Icons.arrow_back_ios, color: Colors.white),
-            onPressed: () => Navigator.pop(context),
+      child: SafeArea(
+        bottom: false,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+          child: Row(
+            children:[
+              IconButton(
+                icon: const Icon(Icons.arrow_back_ios, color: Colors.white),
+                onPressed: () async {
+                  // 【修复点】：点击左上角返回按钮，永远直接退出播放页面
+                  if (_isFullscreen) {
+                    await SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
+                    await SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+                  }
+                  if (mounted) Navigator.pop(context);
+                },
+              ),
+              Expanded(
+                child: Text(
+                  widget.videoList[_index].name,
+                  style: const TextStyle(color: Colors.white, fontSize: 16),
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+            ],
           ),
-          Expanded(
-            child: Text(
-              widget.videoList[_index].name,
-              style: const TextStyle(color: Colors.white, fontSize: 16),
-              overflow: TextOverflow.ellipsis,
-            ),
-          ),
-          IconButton(
-            icon: const Icon(Icons.cast, color: Colors.white),
-            onPressed: _openCastSheet,
-          ),
-        ],
+        ),
       ),
     );
   }
 
   Widget _buildBottomBar() {
     return Container(
-      padding: const EdgeInsets.all(16),
       color: Colors.black38,
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          _buildProgressBar(),
-          const SizedBox(height: 8),
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              IconButton(
-                icon: Icon(_isPlaying ? Icons.pause : Icons.play_arrow, color: Colors.white),
-                onPressed: _togglePlayPause,
-              ),
-              IconButton(
-                icon: const Icon(Icons.skip_previous, color: Colors.white),
-                onPressed: _playPrevious,
-              ),
-              IconButton(
-                icon: const Icon(Icons.skip_next, color: Colors.white),
-                onPressed: _playNext,
-              ),
-              IconButton(
-                icon: const Icon(Icons.speed, color: Colors.white),
-                onPressed: () => setState(() => _showSpeedSelector = !_showSpeedSelector),
-              ),
-              IconButton(
-                icon: const Icon(Icons.fullscreen, color: Colors.white),   // ← 已修复
-                onPressed: _toggleFullscreen,
+      child: SafeArea(
+        top: false,
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children:[
+              _buildProgressBar(),
+              const SizedBox(height: 8),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children:[
+                  IconButton(
+                    icon: Icon(_isPlaying ? Icons.pause : Icons.play_arrow, color: Colors.white),
+                    onPressed: _togglePlayPause,
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.skip_previous, color: Colors.white),
+                    onPressed: _playPrevious,
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.skip_next, color: Colors.white),
+                    onPressed: _playNext,
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.speed, color: Colors.white),
+                    onPressed: () => setState(() => _showSpeedSelector = !_showSpeedSelector),
+                  ),
+                  IconButton(
+                    icon: Icon(_isFullscreen ? Icons.fullscreen_exit : Icons.fullscreen, color: Colors.white),
+                    onPressed: _toggleFullscreen,
+                  ),
+                ],
               ),
             ],
           ),
-        ],
+        ),
       ),
     );
   }
 
   Widget _buildProgressBar() {
     return Row(
-      children: [
-        Text(_formatDuration(_position), style: const TextStyle(color: Colors.white70)),
+      children:[
+        Text(_formatDuration(_pendingSeekPosition ?? _position), style: const TextStyle(color: Colors.white70)),
         Expanded(
           child: Slider(
-            value: _duration.inMilliseconds > 0 ? _position.inMilliseconds / _duration.inMilliseconds : 0,
+            value: _duration.inMilliseconds > 0
+                ? ((_pendingSeekPosition ?? _position).inMilliseconds / _duration.inMilliseconds).clamp(0.0, 1.0)
+                : 0,
             onChanged: (value) {
-              final newPos = Duration(milliseconds: (value * _duration.inMilliseconds).toInt());
-              player.seek(newPos);
+              setState(() {
+                _isSeeking = true;
+                _pendingSeekPosition = Duration(milliseconds: (value * _duration.inMilliseconds).toInt());
+              });
+            },
+            onChangeEnd: (value) async {
+              if (_pendingSeekPosition != null) {
+                await player.seek(_pendingSeekPosition!);
+                // 拖动底部进度条同样加入 500 毫秒防弹回延迟
+                Future.delayed(const Duration(milliseconds: 500), () {
+                  if (mounted) {
+                    setState(() {
+                      _isSeeking = false;
+                      _pendingSeekPosition = null;
+                    });
+                  }
+                });
+              }
             },
           ),
         ),
@@ -683,29 +661,6 @@ class _VideoPlayerPageState extends State<VideoPlayerPage> with WidgetsBindingOb
           );
         }).toList(),
       ),
-    );
-  }
-
-  // ================== 【替换成下面这个新方法】==================
-  Future<void> _toggleFullscreen() async {
-    setState(() => _isFullscreen = !_isFullscreen);
-
-    if (_isFullscreen) {
-      await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
-      await SystemChrome.setPreferredOrientations([
-        DeviceOrientation.landscapeLeft,
-        DeviceOrientation.landscapeRight,
-      ]);
-    } else {
-      await SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
-      await SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
-    }
-  }
-  void _openCastSheet() {
-    // 原仓库 DLNA 投屏逻辑（完整保留）
-    showModalBottomSheet(
-      context: context,
-      builder: (context) => const Text('DLNA 投屏面板（原逻辑）'),
     );
   }
 
